@@ -46,6 +46,9 @@ playback order always matches text order even though synthesis happens
 after the text (and therefore the subtitle) is already on screen. If no
 voice model is installed, tts.py's synthesize_pcm() returns None and no
 audio messages are sent at all — text-only turns keep working as before.
+After each audio block is sent, the listening pipeline is muted for its
+playback duration (ActiveListeningPipeline.mute_for_playback) so the
+backend mic doesn't transcribe the assistant's own voice.
 
 Auth: ClaudeSDKClient shells out to a bundled Claude Code CLI, which
 resolves credentials the same way the CLI itself does — an explicit
@@ -183,6 +186,8 @@ async def handle_connection(
             }))
             await websocket.send(pcm)
             await websocket.send(json.dumps({"type": "audio_end"}))
+            # The shell starts playing on audio_end; stop listening until it's done.
+            pipeline.mute_for_playback(len(pcm) / 2 / synthesizer.sample_rate)
 
     async def can_use_tool(tool_name, input_data, context):
         nonlocal pending_confirmation_request_id

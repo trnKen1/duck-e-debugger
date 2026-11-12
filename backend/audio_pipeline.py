@@ -8,14 +8,23 @@ transcribes accepted segments with faster-whisper (GPU).
 If no voice_profile.npy exists yet (see enroll_voice.py), speaker filtering
 is skipped and every detected utterance is transcribed — useful for testing
 the VAD/STT stages before enrolling, but not the intended steady state.
+
+Two details keep the input clean:
+- Pre-roll: the last ~300ms of audio before VAD fires is kept and prepended
+  to each utterance, so soft word onsets ("h", "f", "s") aren't clipped.
+- Playback mute: while the shell is playing a reply (see mute_for_playback,
+  called by server.py), mic audio is dropped, so the assistant never hears
+  itself. Trade-off: you can't talk over a reply.
 """
 
 import asyncio
+import collections
 import logging
 import os
 import queue
 import sys
 import sysconfig
+import time
 
 import numpy as np
 import sounddevice as sd
@@ -56,6 +65,13 @@ MIN_UTTERANCE_SECONDS = 0.3  # discard shorter blips (coughs, clicks)
 # Silero's default (100ms) ends an utterance at every mid-sentence pause,
 # turning one spoken request into several fragmentary agent turns.
 VAD_MIN_SILENCE_MS = 700
+# Silero only fires "start" once speech is already underway; without this,
+# the first syllable of a softly spoken word can be lost.
+PREROLL_SECONDS = 0.3
+PREROLL_CHUNKS = round(PREROLL_SECONDS * SAMPLE_RATE / VAD_CHUNK_SAMPLES)
+# Extra mute time after a reply's audio should have finished: covers room
+# echo and small shell-side scheduling delays.
+PLAYBACK_TAIL_SECONDS = 0.4
 SPEAKER_MATCH_THRESHOLD = 0.75
 PROFILE_PATH = os.path.join(os.path.dirname(__file__), "voice_profile.npy")
 WHISPER_MODEL_SIZE = "small"
@@ -72,8 +88,12 @@ class ActiveListeningPipeline:
         self._encoder = VoiceEncoder()  # auto-selects CUDA if available, else CPU
         self._profile = self._load_profile()
         self._whisper = self._load_whisper()
-        self._audio_queue: "queue.Queue[np.ndarray]" = queue.Queue()
+        # (capture time from time.monotonic(), samples)
+        self._audio_queue: "queue.Queue[tuple[float, np.ndarray]]" = queue.Queue()
         self._stream: sd.InputStream | None = None
+        # Mic audio captured in [_mute_from, _playback_end + tail] is dropped.
+        self._mute_from = 0.0
+        self._playback_end = 0.0
 
     def _load_whisper(self) -> WhisperModel:
         try:
@@ -107,7 +127,7 @@ class ActiveListeningPipeline:
         def callback(indata, frames, time_info, status):
             if status:
                 log.warning("sounddevice status: %s", status)
-            self._audio_queue.put(indata[:, 0].copy())
+            self._audio_queue.put((time.monotonic(), indata[:, 0].copy()))
 
         self._stream = sd.InputStream(
             samplerate=SAMPLE_RATE,
@@ -125,6 +145,20 @@ class ActiveListeningPipeline:
             self._stream.close()
             self._stream = None
         log.info("mic stream stopped")
+
+    def mute_for_playback(self, seconds: float) -> None:
+        """Called by server.py when it sends a reply's audio to the shell.
+        Mirrors the shell's back-to-back scheduling (handleAudioEnd in
+        main.js): this clip plays when the previous one ends, or now if
+        nothing is playing. Mic audio captured until then (plus a short
+        echo tail) is dropped."""
+        now = time.monotonic()
+        if now > self._playback_end + PLAYBACK_TAIL_SECONDS:
+            self._mute_from = now
+        self._playback_end = max(self._playback_end, now) + seconds
+
+    def _is_muted(self, captured_at: float) -> bool:
+        return self._mute_from <= captured_at <= self._playback_end + PLAYBACK_TAIL_SECONDS
 
     def _speaker_matches(self, segment: np.ndarray) -> bool:
         if self._profile is None:
@@ -157,31 +191,54 @@ class ActiveListeningPipeline:
 
     async def listen(self):
         """Async generator yielding transcribed text for accepted utterances."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
+        preroll: collections.deque[np.ndarray] = collections.deque(maxlen=PREROLL_CHUNKS)
         buffer: list[np.ndarray] = []
+        speech_start_s = 0.0
         in_speech = False
+        muted = False
 
         while True:
-            chunk = await loop.run_in_executor(None, self._audio_queue.get)
-            event = self._vad_iterator(chunk, return_seconds=True)
+            captured_at, chunk = await loop.run_in_executor(None, self._audio_queue.get)
 
+            if self._is_muted(captured_at):
+                if not muted:
+                    muted = True
+                    if in_speech:
+                        log.info("utterance dropped — reply playback started mid-speech")
+                    buffer, in_speech = [], False
+                    preroll.clear()  # would otherwise hold the start of the reply
+                    self._vad_iterator.reset_states()
+                continue
+            muted = False
+
+            event = self._vad_iterator(chunk, return_seconds=True)
             if in_speech:
                 buffer.append(chunk)
-
-            if event and "start" in event:
+            elif event and "start" in event:
                 in_speech = True
-                buffer = [chunk]
-            elif event and "end" in event and in_speech:
-                in_speech = False
-                segment = np.concatenate(buffer) if buffer else np.array([], dtype="float32")
-                buffer = []
-                if segment.size < SAMPLE_RATE * MIN_UTTERANCE_SECONDS:
-                    continue
+                buffer = [*preroll, chunk]
+                speech_start_s = event["start"]
+            preroll.append(chunk)
 
-                matched = await loop.run_in_executor(None, self._speaker_matches, segment)
-                if not matched:
-                    continue
+            if not (event and "end" in event and in_speech):
+                continue
+            in_speech = False
+            segment = np.concatenate(buffer)
+            buffer = []
+            # Judge length on Silero's own speech timestamps, not the
+            # segment: the segment also holds pre-roll and the
+            # VAD_MIN_SILENCE_MS of trailing silence, which would let any
+            # cough or click past the minimum.
+            speech_s = event["end"] - speech_start_s
+            if speech_s < MIN_UTTERANCE_SECONDS:
+                log.debug("discarded %.2fs blip (below %.1fs minimum)", speech_s, MIN_UTTERANCE_SECONDS)
+                continue
 
-                text = await loop.run_in_executor(None, self._transcribe, segment)
-                if text:
-                    yield text
+            matched = await loop.run_in_executor(None, self._speaker_matches, segment)
+            if not matched:
+                continue
+
+            text = await loop.run_in_executor(None, self._transcribe, segment)
+            if text:
+                yield text
