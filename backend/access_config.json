@@ -1,3 +1,9 @@
 {
-  "allowed_tools": ["Read", "Glob", "Grep"]
+  "allowed_tools": ["Read", "Glob", "Grep"],
+  "working_dir": "~/OneDrive/Documents/PROJECTS",
+  "known_locations": {
+    "Code projects (one folder per repo, including this one: voice-in-the-shell, also called Duck-e-bugger)": "~/OneDrive/Documents/PROJECTS",
+    "Obsidian vault (project plans, test notes, personal notes; software projects are under '20 Software')": "~/OneDrive/Documents/Notes/obsd-claude"
+  },
+  "vocabulary": ["Duck-e-bugger", "Duck-e-debugger", "Obsidian", "Tauri", "VS Code", "Claude", "Piper", "Whisper"]
 }
