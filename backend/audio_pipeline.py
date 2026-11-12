@@ -78,7 +78,12 @@ WHISPER_MODEL_SIZE = "small"
 
 
 class ActiveListeningPipeline:
-    def __init__(self) -> None:
+    def __init__(self, vocabulary: list[str] | None = None) -> None:
+        # Names Whisper should prefer when the audio is ambiguous (e.g.
+        # "Duck-e-bugger", which it otherwise hears as "Duckley Debugger").
+        # Passed as faster-whisper hotwords; from access_config.json.
+        self._vocabulary = [v.lower() for v in vocabulary or []]
+        self._hotwords = ", ".join(vocabulary) if vocabulary else None
         self._vad_model = load_silero_vad()
         self._vad_iterator = VADIterator(
             self._vad_model,
@@ -186,8 +191,24 @@ class ActiveListeningPipeline:
         return matched
 
     def _transcribe(self, segment: np.ndarray) -> str:
-        segments, _info = self._whisper.transcribe(segment, language="en")
-        return " ".join(s.text.strip() for s in segments).strip()
+        segments, _info = self._whisper.transcribe(
+            segment, language="en", hotwords=self._hotwords
+        )
+        text = " ".join(s.text.strip() for s in segments).strip()
+        if self._is_only_vocabulary(text):
+            log.info("dropped transcript %r: only hotwords, likely a Whisper hallucination", text)
+            return ""
+        return text
+
+    def _is_only_vocabulary(self, text: str) -> bool:
+        """With nothing intelligible to transcribe, Whisper tends to echo
+        the hotwords back verbatim (checked on 1s of silence)."""
+        if not self._vocabulary or not text:
+            return False
+        rest = text.lower()
+        for word in sorted(self._vocabulary, key=len, reverse=True):
+            rest = rest.replace(word, " ")
+        return not any(ch.isalnum() for ch in rest)
 
     async def listen(self):
         """Async generator yielding transcribed text for accepted utterances."""
@@ -232,13 +253,26 @@ class ActiveListeningPipeline:
             # cough or click past the minimum.
             speech_s = event["end"] - speech_start_s
             if speech_s < MIN_UTTERANCE_SECONDS:
-                log.debug("discarded %.2fs blip (below %.1fs minimum)", speech_s, MIN_UTTERANCE_SECONDS)
+                # INFO, not DEBUG: a short "yes" to a permission prompt lands
+                # here too, and was otherwise dropped without a trace.
+                log.info("discarded %.2fs blip (below %.1fs minimum)", speech_s, MIN_UTTERANCE_SECONDS)
                 continue
 
+            t_vad_end = time.monotonic()
             matched = await loop.run_in_executor(None, self._speaker_matches, segment)
+            t_speaker = time.monotonic()
             if not matched:
                 continue
 
             text = await loop.run_in_executor(None, self._transcribe, segment)
+            t_done = time.monotonic()
+            log.info(
+                "timing: transcript ready %.2fs after VAD end (speaker check %.2fs, "
+                "whisper %.2fs); VAD itself waits %dms of silence before ending",
+                t_done - t_vad_end,
+                t_speaker - t_vad_end,
+                t_done - t_speaker,
+                VAD_MIN_SILENCE_MS,
+            )
             if text:
                 yield text

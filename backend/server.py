@@ -50,6 +50,13 @@ After each audio block is sent, the listening pipeline is muted for its
 playback duration (ActiveListeningPipeline.mute_for_playback) so the
 backend mic doesn't transcribe the assistant's own voice.
 
+Voice setup (2026-11-12): the agent gets Claude Code's system prompt plus
+VOICE_PROMPT (spoken replies, no markdown, ask instead of guessing, known
+locations), starts in access_config.json's working_dir, and loads no MCP
+servers — see build_agent_options(). Every assistant text block goes through
+speech_text.to_speakable() before it's shown or spoken. Per-turn timing and
+each tool call's duration are logged at INFO ("timing: ..." / "tool ...").
+
 Auth: ClaudeSDKClient shells out to a bundled Claude Code CLI, which
 resolves credentials the same way the CLI itself does — an explicit
 ANTHROPIC_API_KEY (metered billing) if set, otherwise the machine's
@@ -62,6 +69,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import uuid
 from pathlib import Path
 
@@ -76,7 +84,11 @@ from claude_agent_sdk import (
     PermissionResultAllow,
     PermissionResultDeny,
     ResultMessage,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
 )
+from speech_text import to_speakable
 from tts import SpeechSynthesizer
 from voice_commands import interpret_yes_no
 
@@ -116,27 +128,110 @@ def describe_auth() -> str:
     )
 
 
-def load_allowed_tools() -> list[str]:
+VOICE_PROMPT = """\
+You are Duck-e-bugger, a voice assistant. The user talks to you through a \
+microphone: their words reach you as speech-to-text transcripts. Everything \
+you write is read aloud by a text-to-speech voice and shown as a one-line \
+subtitle.
+
+How to reply:
+- Write plain spoken sentences. No markdown: no asterisks, headings, bullet \
+lists, tables or code blocks. Don't read out full file paths or URLs; name the \
+file, folder or site instead.
+- Keep it short: one to three sentences, unless the user asks for more detail.
+- Before a tool call that may take a while, say in a few words what you're \
+about to do.
+- Transcripts can mishear names (for example "Duckley Debugger" for \
+"Duck-e-bugger"). If a name doesn't match anything, try the closest match in \
+the known locations before searching further.
+- If it's unclear which project, folder or file the user means, ask one short \
+question instead of guessing.
+- Never search the whole home directory or the whole OneDrive folder; those \
+searches take minutes. Start from the known locations below and keep searches \
+narrow.
+"""
+
+
+def load_access_config() -> dict:
+    """access_config.json, or {} if it's missing or unreadable (every
+    setting has a default)."""
     if os.path.exists(ACCESS_CONFIG_PATH):
         try:
             with open(ACCESS_CONFIG_PATH, encoding="utf-8") as f:
                 config = json.load(f)
-            tools = config.get("allowed_tools")
-            if isinstance(tools, list):
-                return tools
+            if isinstance(config, dict):
+                return config
         except (json.JSONDecodeError, OSError) as exc:
             log.warning("failed to read %s (%s), using defaults", ACCESS_CONFIG_PATH, exc)
-    return DEFAULT_ALLOWED_TOOLS
+    return {}
+
+
+def load_allowed_tools(config: dict) -> list[str]:
+    tools = config.get("allowed_tools")
+    return tools if isinstance(tools, list) else DEFAULT_ALLOWED_TOOLS
+
+
+def _existing_dir(raw: str) -> Path | None:
+    path = Path(raw).expanduser()
+    if path.is_dir():
+        return path
+    log.warning("access_config.json: %s is not a folder, skipping it", path)
+    return None
+
+
+def build_agent_options(config: dict, can_use_tool) -> ClaudeAgentOptions:
+    """Options for the voice agent: Claude Code's own system prompt plus
+    VOICE_PROMPT and the known locations, starting in working_dir, and with
+    no MCP servers. Without strict_mcp_config the bundled CLI also loads
+    every claude.ai connector on the account (Gmail, Claude Docs, ... — 18 of
+    them when checked on 2026-11-12), which sent a request about "the
+    project" off to Claude Docs and added tokens to every turn."""
+    locations = {
+        label: path
+        for label, raw in (config.get("known_locations") or {}).items()
+        if (path := _existing_dir(raw)) is not None
+    }
+    prompt = VOICE_PROMPT
+    if locations:
+        prompt += "\nKnown locations:\n" + "".join(
+            f"- {label}: {path}\n" for label, path in locations.items()
+        )
+
+    working_dir = _existing_dir(config["working_dir"]) if config.get("working_dir") else None
+    return ClaudeAgentOptions(
+        allowed_tools=load_allowed_tools(config),
+        permission_mode="default",
+        can_use_tool=can_use_tool,
+        system_prompt={"type": "preset", "preset": "claude_code", "append": prompt},
+        cwd=working_dir,
+        add_dirs=[p for p in locations.values() if p != working_dir],
+        mcp_servers={},
+        strict_mcp_config=True,
+        env={"ENABLE_CLAUDEAI_MCP_SERVERS": "false"},
+    )
+
+
+def summarize_tool_input(input_data: dict) -> str:
+    """One short line for the log — never a whole file's contents."""
+    for key in ("command", "file_path", "path", "pattern", "url", "query"):
+        if key in input_data:
+            text = str(input_data[key])
+            return text if len(text) <= 120 else text[:117] + "..."
+    return ", ".join(input_data) or "(no input)"
 
 
 async def handle_connection(
-    websocket, pipeline: ActiveListeningPipeline, synthesizer: SpeechSynthesizer
+    websocket,
+    pipeline: ActiveListeningPipeline,
+    synthesizer: SpeechSynthesizer,
+    config: dict,
 ) -> None:
     log.info("shell connected")
     pending_permissions: dict[str, asyncio.Future] = {}
     pending_confirmation_request_id: str | None = None
     transcript_queue: asyncio.Queue[str] = asyncio.Queue()
-    tts_queue: asyncio.Queue[str] = asyncio.Queue()
+    # (text to speak, monotonic start time of the turn it belongs to)
+    tts_queue: asyncio.Queue[tuple[str, float]] = asyncio.Queue()
 
     async def resolve_permission(request_id: str, allow: bool, message: str | None = None) -> bool:
         """Resolves a pending can_use_tool future and notifies the shell.
@@ -173,11 +268,18 @@ async def handle_connection(
         order — keeps audio playback order matching text order even though
         synthesis (and therefore each block's audio) always lags a bit
         behind its already-displayed subtitle."""
+        last_timed_turn = None
         while True:
-            text = await tts_queue.get()
+            text, turn_started_at = await tts_queue.get()
             pcm = await asyncio.to_thread(synthesizer.synthesize_pcm, text)
             if not pcm:
                 continue
+            if turn_started_at != last_timed_turn:
+                last_timed_turn = turn_started_at
+                log.info(
+                    "timing: first audio sent %.1fs after the request",
+                    time.monotonic() - turn_started_at,
+                )
             await websocket.send(json.dumps({
                 "type": "audio_start",
                 "sample_rate": synthesizer.sample_rate,
@@ -213,28 +315,52 @@ async def handle_connection(
             return PermissionResultAllow(updated_input=input_data)
         return PermissionResultDeny(message=message or "Denied by user")
 
-    options = ClaudeAgentOptions(
-        allowed_tools=load_allowed_tools(),
-        permission_mode="default",
-        can_use_tool=can_use_tool,
-    )
+    options = build_agent_options(config, can_use_tool)
 
     async def run_turns(client: ClaudeSDKClient) -> None:
         while True:
             text = await transcript_queue.get()
             await websocket.send(json.dumps({"type": "speaking_start"}))
+            started_at = time.monotonic()
+            first_text_s: float | None = None
+            running_tools: dict[str, tuple[str, float]] = {}  # tool_use_id -> (name, start)
+            tool_times: list[str] = []
             try:
                 await client.query(text)
                 async for message in client.receive_response():
                     if isinstance(message, AssistantMessage):
                         for block in message.content:
-                            if hasattr(block, "text"):
+                            if isinstance(block, ToolUseBlock):
+                                running_tools[block.id] = (block.name, time.monotonic())
+                                log.info(
+                                    "tool %s started: %s",
+                                    block.name,
+                                    summarize_tool_input(block.input),
+                                )
+                            elif hasattr(block, "text"):
+                                spoken = to_speakable(block.text)
+                                if not spoken:
+                                    continue
+                                if first_text_s is None:
+                                    first_text_s = time.monotonic() - started_at
                                 await websocket.send(json.dumps({
                                     "type": "assistant_text",
-                                    "text": block.text,
+                                    "text": spoken,
                                 }))
                                 if synthesizer.available:
-                                    await tts_queue.put(block.text)
+                                    await tts_queue.put((spoken, started_at))
+                    elif isinstance(message, UserMessage) and isinstance(message.content, list):
+                        for block in message.content:
+                            if isinstance(block, ToolResultBlock) and block.tool_use_id in running_tools:
+                                name, tool_start = running_tools.pop(block.tool_use_id)
+                                took = time.monotonic() - tool_start
+                                tool_times.append(f"{name} {took:.1f}s")
+                                log.info(
+                                    "tool %s finished in %.1fs%s",
+                                    name,
+                                    took,
+                                    " (error)" if block.is_error else "",
+                                )
                     elif isinstance(message, ResultMessage) and message.subtype != "success":
                         await websocket.send(json.dumps({
                             "type": "error",
@@ -244,11 +370,26 @@ async def handle_connection(
                 log.exception("turn failed")
                 await websocket.send(json.dumps({"type": "error", "message": str(exc)}))
             finally:
+                log.info(
+                    "timing: turn took %.1fs (first text %s; tools: %s)",
+                    time.monotonic() - started_at,
+                    f"{first_text_s:.1f}s" if first_text_s is not None else "none",
+                    ", ".join(tool_times) or "none",
+                )
                 await websocket.send(json.dumps({"type": "speaking_end"}))
                 await websocket.send(json.dumps({"type": "turn_done"}))
 
     pipeline.start()
     async with ClaudeSDKClient(options=options) as client:
+        try:
+            mcp = await client.get_mcp_status()
+            log.info(
+                "agent session ready: %d MCP servers, working dir %s",
+                len(mcp.get("mcpServers", [])),
+                options.cwd or os.getcwd(),
+            )
+        except Exception as exc:  # noqa: BLE001 — diagnostics only
+            log.warning("couldn't read MCP status: %s", exc)
         turn_task = asyncio.create_task(run_turns(client))
         listening_task = asyncio.create_task(run_active_listening())
         tts_task = asyncio.create_task(run_tts())
@@ -274,9 +415,10 @@ async def handle_connection(
 
 async def main() -> None:
     log.info("Claude auth: %s", describe_auth())
+    config = load_access_config()
 
     log.info("loading active-listening pipeline (VAD + speaker filter + STT)...")
-    pipeline = ActiveListeningPipeline()
+    pipeline = ActiveListeningPipeline(vocabulary=config.get("vocabulary"))
     log.info("active-listening pipeline ready")
 
     log.info("loading TTS voice...")
@@ -285,7 +427,7 @@ async def main() -> None:
         log.warning("TTS running text-only — no voice model installed (see download_voice.py)")
 
     async def handler(websocket):
-        await handle_connection(websocket, pipeline, synthesizer)
+        await handle_connection(websocket, pipeline, synthesizer, config)
 
     async with websockets.serve(handler, HOST, PORT):
         log.info("listening on ws://%s:%s", HOST, PORT)
